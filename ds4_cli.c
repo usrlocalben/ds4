@@ -116,6 +116,19 @@ static void usage(FILE *fp) {
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
+        "  --cpu-moe\n"
+        "      Enable hybrid MoE inference: routed MoE layers run on CPU via kt-kernel.\n"
+        "  --n-cpu-moe-layers N\n"
+        "      Number of MoE layers to offload to CPU (0 = all).\n"
+        "  --kt-weight-path PATH\n"
+        "      Path to kt-kernel safetensor weight directory.\n"
+        "  --kt-cpuinfer N\n"
+        "      kt-kernel CPU inference threads. Default: 96\n"
+        "  --kt-threadpool-count N\n"
+        "      kt-kernel NUMA thread pool count. Default: 8\n"
+        "  --kt-method NAME\n"
+        "      kt-kernel compute method: MXFP4 (default), FP8, FP8_PERCHANNEL,\n"
+        "      RAWINT4, AMXINT4, AMXINT8.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1539,9 +1552,21 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.engine.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe-layers")) {
+            c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
+        } else if (!strcmp(arg, "--kt-weight-path")) {
+            c.engine.kt_weight_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kt-cpuinfer")) {
+            c.engine.kt_cpuinfer = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-threadpool-count")) {
+            c.engine.kt_threadpool = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-method")) {
+            c.engine.kt_method = need_arg(&i, argc, argv, arg);
         } else {
             fprintf(stderr, "ds4: unknown option: %s\n", arg);
             usage(stderr);

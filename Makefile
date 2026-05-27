@@ -14,6 +14,27 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
+# ---------------------------------------------------------------------------
+# Optional kt-kernel CPU-MoE bridge (for CUDA / CPU build on non-MacOS)
+# ---------------------------------------------------------------------------
+KT_BRIDGE_DIR ?=
+KT_BRIDGE_LIB ?=
+KT_BRIDGE_INC ?=
+ifneq ($(KT_BRIDGE_DIR),)
+    KT_BRIDGE_CFLAG  := -DHAVE_KT_BRIDGE -I$(KT_BRIDGE_DIR)
+    KT_BRIDGE_LDLIB := -L$(KT_BRIDGE_DIR) -lkt_bridge
+    ifneq ($(KT_BRIDGE_INC),)
+        KT_BRIDGE_CFLAG  += -I$(KT_BRIDGE_INC)
+    endif
+else ifneq ($(KT_BRIDGE_INC),)
+    KT_BRIDGE_CFLAG  := -DHAVE_KT_BRIDGE -I$(KT_BRIDGE_INC)
+    KT_BRIDGE_LDLIB := $(KT_BRIDGE_LIB)
+endif
+# ---------------------------------------------------------------------------
+
+CFLAGS  += $(KT_BRIDGE_CFLAG)
+LDLIBS  += $(KT_BRIDGE_LDLIB)
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
@@ -27,7 +48,7 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas $(KT_BRIDGE_LDLIB)
 CORE_OBJS = ds4.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)

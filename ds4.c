@@ -43,6 +43,9 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#ifdef HAVE_KT_BRIDGE
+#include <kt_bridge.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1608,6 +1611,19 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     return NULL;
 }
 
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+} ds4_byte_range;
+
+static int ds4_byte_range_cmp(const void *a, const void *b) {
+    const ds4_byte_range *ra = a;
+    const ds4_byte_range *rb = b;
+    if (ra->start < rb->start) return -1;
+    if (ra->start > rb->start) return 1;
+    return 0;
+}
+
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
 typedef struct {
@@ -1638,7 +1654,10 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
+static bool accelerator_cache_model_tensor_spans(const ds4_model *m,
+                                                   const ds4_byte_range *skip,
+                                                   size_t n_skip,
+                                                   uint64_t *cached_out) {
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -1647,6 +1666,18 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
+        }
+        if (n_skip > 0) {
+            bool is_expert = false;
+            for (size_t s = 0; s < n_skip; s++) {
+                uint64_t s_start = skip[s].start;
+                uint64_t s_end = skip[s].end;
+                if (t->abs_offset < s_end && t->abs_offset + t->bytes > s_start) {
+                    is_expert = true;
+                    break;
+                }
+            }
+            if (is_expert) continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
@@ -1689,7 +1720,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     return true;
 }
 
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m,
+                                             const ds4_byte_range *skip, size_t n_skip) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
@@ -1698,13 +1730,23 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 
     const double t0 = now_sec();
     uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    if (!accelerator_cache_model_tensor_spans(m, skip, n_skip, &cached)) return false;
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
             const ds4_tensor *t = &m->tensors[i];
             if (t->bytes == 0) continue;
             if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+            if (n_skip > 0) {
+                bool is_expert = false;
+                for (size_t s = 0; s < n_skip; s++) {
+                    if (t->abs_offset < skip[s].end && t->abs_offset + t->bytes > skip[s].start) {
+                        is_expert = true;
+                        break;
+                    }
+                }
+                if (is_expert) continue;
+            }
             char label[128];
             snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
             if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
@@ -1726,9 +1768,12 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     return true;
 }
 #else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m,
+                                             const ds4_byte_range *skip, size_t n_skip) {
     (void)backend;
     (void)m;
+    (void)skip;
+    (void)n_skip;
     return true;
 }
 #endif
@@ -8684,6 +8729,17 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+
+    /* cpu_moe_layer[il] != 0 means layer il should run its routed MoE on CPU
+     * via the CPU reference kernel or the optional kt-kernel bridge. */
+    bool cpu_moe_layer[DS4_MAX_LAYER];
+
+#ifdef HAVE_KT_BRIDGE
+    /* Non-owning aliases to the engine's kt-kernel MoE handles. */
+    const ktb_moe_t  *kt_moe;
+    ktb_engine_t      kt_engine;
+    const ds4_layer_weights *cpu_moe_async_layer_base;
+#endif
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -10471,7 +10527,33 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+   if (ok && g->cpu_moe_layer[il]) {
+#ifdef HAVE_KT_BRIDGE
+        if (g->kt_moe && g->kt_moe[il]) {
+            float   *xs_host   = (float *)  alloca(DS4_N_EMBD * sizeof(float));
+            int32_t *sel_host  = (int32_t *)alloca(DS4_N_EXPERT_USED * sizeof(int32_t));
+            float   *w_host    = (float *)  alloca(DS4_N_EXPERT_USED * sizeof(float));
+            float   *out_host  = (float *)  alloca(DS4_N_EMBD * sizeof(float));
+            ok = ds4_gpu_tensor_read(g->ffn_norm,        0, xs_host,  DS4_N_EMBD * sizeof(float)) != 0 &&
+                 ds4_gpu_tensor_read(g->router_selected, 0, sel_host, DS4_N_EXPERT_USED * sizeof(int32_t)) != 0 &&
+                 ds4_gpu_tensor_read(g->router_weights,  0, w_host,   DS4_N_EXPERT_USED * sizeof(float)) != 0;
+            if (ok) {
+                ktb_moe_forward_f32(
+                    g->kt_moe[il],
+                    /*n_tokens=*/1,
+                    /*input_f32=*/xs_host,
+                    /*output_f32=*/out_host,
+                    /*expert_ids_i32=*/sel_host,
+                    /*weights=*/w_host,
+                    /*incremental=*/false,
+                    DS4_SWIGLU_CLAMP_EXP);
+                ok = ds4_gpu_tensor_write(g->routed_out, 0, out_host, DS4_N_EMBD * sizeof(float)) != 0;
+            }
+        } else
+#endif
+        {
+            /* No kt-bridge or CPU fallback at decode time; fall through to GPU */
+            ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -10490,6 +10572,28 @@ static bool metal_graph_encode_decode_layer(
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+        }
+    } else if (ok) {
+        ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+                                             g->routed_gate,
+                                             g->routed_up,
+                                             g->routed_mid,
+                                             g->routed_down,
+                                             model->map, model->size,
+                                             layer->ffn_gate_exps->abs_offset,
+                                             layer->ffn_up_exps->abs_offset,
+                                             layer->ffn_down_exps->abs_offset,
+                                             layer->ffn_gate_exps->type,
+                                             layer->ffn_down_exps->type,
+                                             gate_expert_bytes, gate_row_bytes,
+                                             down_expert_bytes, down_row_bytes,
+                                             (uint32_t)expert_in_dim,
+                                             (uint32_t)down_in_dim,
+                                             (uint32_t)routed_out_dim,
+                                             g->router_selected, g->router_weights,
+                                             DS4_N_EXPERT,
+                                             DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -13310,37 +13414,98 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->batch_router_weights,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
     }
-    DS4_METAL_PROFILE_FFN_STAGE("router");
+   DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) {
+    if (ok && g->cpu_moe_layer[il]) {
+#ifdef HAVE_KT_BRIDGE
+        if (g->kt_moe && g->kt_moe[il]) {
+            size_t n = (size_t)n_tokens;
+            size_t ne = (size_t)DS4_N_EXPERT_USED;
+            size_t xs_bytes  = n * DS4_N_EMBD * sizeof(float);
+            size_t sel_bytes = n * ne * sizeof(int32_t);
+            size_t w_bytes   = n * ne * sizeof(float);
+            size_t out_bytes = n * DS4_N_EMBD * sizeof(float);
+            float   *xs_host   = (float *)  malloc(xs_bytes);
+            int32_t *sel_host  = (int32_t *)malloc(sel_bytes);
+            float   *w_host    = (float *)  malloc(w_bytes);
+            float   *out_host  = (float *)  malloc(out_bytes);
+            if (xs_host && sel_host && w_host && out_host) {
+                ok = ds4_gpu_tensor_read(g->batch_ffn_norm,        0, xs_host,  xs_bytes) != 0 &&
+                     ds4_gpu_tensor_read(g->batch_router_selected, 0, sel_host, sel_bytes) != 0 &&
+                     ds4_gpu_tensor_read(g->batch_router_weights,  0, w_host,   w_bytes) != 0;
+                if (ok) {
+                    ktb_moe_forward_f32(
+                        g->kt_moe[il],
+                        (int)n,
+                        xs_host, out_host,
+                        sel_host, w_host,
+                        false,
+                        DS4_SWIGLU_CLAMP_EXP);
+                    ok = ds4_gpu_tensor_write(g->batch_routed_out, 0, out_host, out_bytes) != 0;
+                }
+            }
+            free(xs_host); free(sel_host); free(w_host); free(out_host);
+        } else
+#endif
+        {
+            ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                                    g->batch_routed_gate,
+                                                    g->batch_routed_up,
+                                                    g->batch_routed_mid,
+                                                    g->batch_routed_down,
+                                                    model->map,
+                                                    model->size,
+                                                    layer->ffn_gate_exps->abs_offset,
+                                                    layer->ffn_up_exps->abs_offset,
+                                                    layer->ffn_down_exps->abs_offset,
+                                                    layer->ffn_gate_exps->type,
+                                                    layer->ffn_down_exps->type,
+                                                    gate_expert_bytes,
+                                                    gate_row_bytes,
+                                                    down_expert_bytes,
+                                                    down_row_bytes,
+                                                    (uint32_t)expert_in_dim,
+                                                    (uint32_t)down_in_dim,
+                                                    (uint32_t)routed_out_dim,
+                                                    g->batch_router_selected,
+                                                    g->batch_router_weights,
+                                                    DS4_N_EXPERT,
+                                                    DS4_N_EXPERT_USED,
+                                                    DS4_SWIGLU_CLAMP_EXP,
+                                                    g->batch_ffn_norm,
+                                                    il,
+                                                    n_tokens,
+                                                    &g->batch_routed_mid_is_f16) != 0;
+        }
+    } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
-                                               g->batch_routed_gate,
-                                               g->batch_routed_up,
-                                               g->batch_routed_mid,
-                                               g->batch_routed_down,
-                                               model->map,
-                                               model->size,
-                                               layer->ffn_gate_exps->abs_offset,
-                                               layer->ffn_up_exps->abs_offset,
-                                               layer->ffn_down_exps->abs_offset,
-                                               layer->ffn_gate_exps->type,
-                                               layer->ffn_down_exps->type,
-                                               gate_expert_bytes,
-                                               gate_row_bytes,
-                                               down_expert_bytes,
-                                               down_row_bytes,
-                                               (uint32_t)expert_in_dim,
-                                               (uint32_t)down_in_dim,
-                                               (uint32_t)routed_out_dim,
-                                               g->batch_router_selected,
-                                               g->batch_router_weights,
-                                               DS4_N_EXPERT,
-                                               DS4_N_EXPERT_USED,
-                                               DS4_SWIGLU_CLAMP_EXP,
-                                               g->batch_ffn_norm,
-                                               il,
-                                               n_tokens,
-                                               &g->batch_routed_mid_is_f16) != 0;
+                                                g->batch_routed_gate,
+                                                g->batch_routed_up,
+                                                g->batch_routed_mid,
+                                                g->batch_routed_down,
+                                                model->map,
+                                                model->size,
+                                                layer->ffn_gate_exps->abs_offset,
+                                                layer->ffn_up_exps->abs_offset,
+                                                layer->ffn_down_exps->abs_offset,
+                                                layer->ffn_gate_exps->type,
+                                                layer->ffn_down_exps->type,
+                                                gate_expert_bytes,
+                                                gate_row_bytes,
+                                                down_expert_bytes,
+                                                down_row_bytes,
+                                                (uint32_t)expert_in_dim,
+                                                (uint32_t)down_in_dim,
+                                                (uint32_t)routed_out_dim,
+                                                g->batch_router_selected,
+                                                g->batch_router_weights,
+                                                DS4_N_EXPERT,
+                                                DS4_N_EXPERT_USED,
+                                                DS4_SWIGLU_CLAMP_EXP,
+                                                g->batch_ffn_norm,
+                                                il,
+                                                n_tokens,
+                                                &g->batch_routed_mid_is_f16) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
@@ -15070,6 +15235,16 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+
+    bool cpu_moe;
+    bool cpu_moe_layer[DS4_MAX_LAYER];
+
+#ifdef HAVE_KT_BRIDGE
+    ktb_engine_t     kt_engine;
+    ktb_moe_t        kt_moe[DS4_MAX_LAYER];
+    ktb_safetensor_t kt_safetensor;
+    bool             kt_ready;
+#endif
 };
 
 static bool cpu_directional_steering_enabled(
@@ -17982,6 +18157,24 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e, ds4_byte_range *ranges) {
+    size_t n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!e->cpu_moe_layer[il]) continue;
+        const ds4_layer_weights *L = &e->weights.layer[il];
+        const ds4_tensor *exps[] = { L->ffn_gate_exps, L->ffn_up_exps, L->ffn_down_exps };
+        for (uint32_t ei = 0; ei < 3; ei++) {
+            const ds4_tensor *t = exps[ei];
+            if (!t || t->bytes == 0) continue;
+            ranges[n].start = t->abs_offset;
+            ranges[n].end = t->abs_offset + t->bytes;
+            n++;
+        }
+    }
+    if (n > 1) qsort(ranges, n, sizeof(ranges[0]), ds4_byte_range_cmp);
+    return n;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -17990,6 +18183,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->quality = opt->quality;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
+    e->cpu_moe = false;
+    memset(e->cpu_moe_layer, 0, sizeof(e->cpu_moe_layer));
+#ifdef HAVE_KT_BRIDGE
+    e->kt_engine = NULL;
+    memset(e->kt_moe, 0, sizeof(e->kt_moe));
+    e->kt_safetensor = NULL;
+    e->kt_ready = false;
+#endif
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
@@ -18075,12 +18276,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
+       if (e->mtp_ready &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
+                                            e->mtp_model.size,
+                                            e->mtp_model.tensor_data_pos,
+                                            e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                            e->mtp_model.max_tensor_bytes))
         {
             fprintf(stderr,
                     "ds4: %s failed to map MTP model views; aborting startup. "
@@ -18090,13 +18291,99 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+
+        /* CPU-MoE: --cpu-moe routes all MoE layers to CPU.  --n-cpu-moe-layers N
+         * routes only the first N layers (or all if 0).  kt-kernel is required
+         * on non-Metal builds; the reference CPU MoE is Metal-only. */
+        if (opt->cpu_moe || opt->n_cpu_moe_layers > 0) {
+            e->cpu_moe = true;
+            uint32_t n = opt->n_cpu_moe_layers > 0 ? (uint32_t)opt->n_cpu_moe_layers
+                                                    : DS4_N_LAYER;
+            if (n > DS4_N_LAYER) n = DS4_N_LAYER;
+            for (uint32_t il = 0; il < n; il++) {
+                e->cpu_moe_layer[il] = true;
+            }
+            fprintf(stderr, "ds4: cpu-moe enabled for %u layers\n", n);
+        }
+
+#ifdef HAVE_KT_BRIDGE
+        if (e->cpu_moe && opt->kt_weight_path && opt->kt_weight_path[0]) {
+            int n_threads  = opt->kt_cpuinfer    > 0 ? opt->kt_cpuinfer    : 96;
+            int n_numa     = opt->kt_threadpool  > 0 ? opt->kt_threadpool  : 8;
+            e->kt_engine = ktb_engine_create(n_threads, n_numa);
+            if (!e->kt_engine) {
+                fprintf(stderr, "ds4: failed to create kt-kernel engine\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->kt_safetensor = ktb_safetensor_open(opt->kt_weight_path);
+            if (!e->kt_safetensor) {
+                fprintf(stderr, "ds4: failed to open kt-kernel safetensors in '%s'\n", opt->kt_weight_path);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            ktb_method_t method = KTB_MXFP4;
+            if (opt->kt_method && opt->kt_method[0]) {
+                if      (!strcmp(opt->kt_method, "FP8"))              method = KTB_FP8;
+                else if (!strcmp(opt->kt_method, "FP8_PERCHANNEL"))   method = KTB_FP8_PERCHANNEL;
+                else if (!strcmp(opt->kt_method, "RAWINT4"))          method = KTB_RAWINT4;
+                else if (!strcmp(opt->kt_method, "AMXINT4"))          method = KTB_AMXINT4;
+                else if (!strcmp(opt->kt_method, "AMXINT8"))          method = KTB_AMXINT8;
+                else if (!strcmp(opt->kt_method, "MXFP4"))           method = KTB_MXFP4;
+                else {
+                    fprintf(stderr, "ds4: unknown --kt-method '%s', using MXFP4\n", opt->kt_method);
+                }
+            }
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (!e->cpu_moe_layer[il]) continue;
+                e->kt_moe[il] = ktb_moe_create(
+                    e->kt_engine,
+                    (int)il,
+                    DS4_N_EXPERT,
+                    DS4_N_EXPERT_USED,
+                    DS4_N_EMBD,
+                    DS4_N_FF_EXP,
+                    method,
+                    DS4_SWIGLU_CLAMP_EXP);
+                if (!e->kt_moe[il]) {
+                    fprintf(stderr, "ds4: failed to create kt-kernel MoE for layer %u\n", il);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                if (ktb_moe_load_weights_safetensors(e->kt_moe[il], e->kt_safetensor, (int)il,
+                                                      NULL) != 0) {
+                    fprintf(stderr, "ds4: failed to load kt-kernel weights for layer %u\n", il);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+            e->kt_ready = true;
+            fprintf(stderr,
+                    "ds4: cpu-moe (kt-kernel): layers 0..%u routed on CPU via kt-kernel (%s)\n",
+                    (uint32_t)(DS4_N_LAYER - 1),
+                    opt->kt_method ? opt->kt_method : "MXFP4");
+        }
+#endif
+
+        ds4_byte_range *skip = NULL;
+        size_t n_skip = 0;
+        if (e->cpu_moe) {
+            skip = calloc((size_t)DS4_N_LAYER * 3, sizeof(*skip));
+            n_skip = engine_collect_cpu_moe_routed_ranges(e, skip);
+        }
+        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model, skip, n_skip)) {
+            free(skip);
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        free(skip);
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -18147,6 +18434,13 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+#ifdef HAVE_KT_BRIDGE
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (e->kt_moe[il]) { ktb_moe_destroy(e->kt_moe[il]); e->kt_moe[il] = NULL; }
+    }
+    if (e->kt_safetensor) { ktb_safetensor_close(e->kt_safetensor); e->kt_safetensor = NULL; }
+    if (e->kt_engine) { ktb_engine_destroy(e->kt_engine); e->kt_engine = NULL; }
+#endif
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
@@ -18157,6 +18451,10 @@ void ds4_engine_close(ds4_engine *e) {
     free(e->directional_steering_file);
     free(e);
 }
+
+#ifndef DS4_NO_GPU
+static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e);
+#endif
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
@@ -18190,13 +18488,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
-                                               e->directional_steering_file,
-                                               e->directional_steering_attn_scale,
-                                               e->directional_steering_ffn_scale)) {
+                                                e->directional_steering_file,
+                                                e->directional_steering_attn_scale,
+                                                e->directional_steering_ffn_scale)) {
         metal_graph_free(&s->graph);
         free(s);
         return 1;
     }
+    metal_graph_apply_engine_runtime(&s->graph, e);
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
@@ -18251,6 +18550,18 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
 }
 
 #ifndef DS4_NO_GPU
+static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
+    if (!g || !e) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
+    }
+#ifdef HAVE_KT_BRIDGE
+    g->kt_moe   = e->kt_moe;
+    g->kt_engine = e->kt_engine;
+    g->cpu_moe_async_layer_base = e->weights.layer;
+#endif
+}
+
 typedef struct {
     ds4_session *session;
     const ds4_tokens *prompt;

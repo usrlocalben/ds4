@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 26px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 14px; font-weight: 600; fill: #334155; }
+.tick { font-size: 12px; fill: #64748b; }
+.legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">RTX 6000 Pro Max-Q, 2S EPYC 9B14, MXFP4</text>
+<line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="472.00" text-anchor="end">0</text>
+<line x1="82" y1="367.50" x2="878" y2="367.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="371.50" text-anchor="end">100</text>
+<line x1="82" y1="267.00" x2="878" y2="267.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="271.00" text-anchor="end">200</text>
+<line x1="82" y1="166.50" x2="878" y2="166.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="170.50" text-anchor="end">300</text>
+<line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="70.00" text-anchor="end">400</text>
+<text class="tick" x="890" y="472.00" text-anchor="start">0</text>
+<text class="tick" x="890" y="371.50" text-anchor="start">10</text>
+<text class="tick" x="890" y="271.00" text-anchor="start">20</text>
+<text class="tick" x="890" y="170.50" text-anchor="start">30</text>
+<text class="tick" x="890" y="70.00" text-anchor="start">40</text>
+<line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
+<line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="324.92" y="492" text-anchor="middle">20k</text>
+<line x1="567.84" y1="66" x2="567.84" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="567.84" y="492" text-anchor="middle">40k</text>
+<line x1="810.76" y1="66" x2="810.76" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="810.76" y="492" text-anchor="middle">60k</text>
+<line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
+<text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
+<text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,141.12 131.75,142.87 156.62,139.64 181.50,141.11 206.38,142.19 231.25,143.54 256.12,144.61 281.00,144.61 305.88,145.60 330.75,147.49 355.62,147.01 380.50,149.07 405.38,148.14 430.25,147.20 455.12,150.46 480.00,151.14 504.88,153.41 529.75,155.58 554.62,154.84 579.50,155.99 604.38,158.88 629.25,157.26 654.12,156.59 679.00,157.60 703.88,157.40 728.75,157.98 753.62,160.41 778.50,160.84 803.38,162.52 828.25,162.81 853.12,164.52 878.00,166.62"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,170.52 131.75,180.77 156.62,180.87 181.50,185.59 206.38,187.81 231.25,189.62 256.12,190.52 281.00,184.99 305.88,187.61 330.75,187.10 355.62,188.41 380.50,188.91 405.38,190.62 430.25,191.22 455.12,192.83 480.00,207.20 504.88,210.82 529.75,211.93 554.62,212.83 579.50,214.34 604.38,215.64 629.25,216.25 654.12,217.76 679.00,218.16 703.88,219.36 728.75,220.07 753.62,220.67 778.50,221.77 803.38,222.18 828.25,223.58 853.12,224.79 878.00,225.90"/>
+<rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
+<rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="730" y="89">prefill</text>
+<rect x="708" y="104" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="730" y="115">generation</text>
+</svg>

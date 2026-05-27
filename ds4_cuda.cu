@@ -1326,6 +1326,12 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
+    static int no_managed = -1;
+    if (no_managed < 0) {
+        const char *env = getenv("DS4_NO_MANAGED_KV");
+        no_managed = (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    if (no_managed) return 0;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
@@ -1436,7 +1442,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         g_model_registered = 0;
     }
     g_model_host_base = model_map;
-    g_model_device_base = (const char *)model_map;
+    g_model_device_base = NULL;
     g_model_registered_size = model_size;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
@@ -1445,49 +1451,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         g_model_fd_host_base = model_map;
     }
 
-    const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
-    if (copy_env && copy_env[0]) {
-        void *dev = NULL;
-        const double t0 = clock() / (double)CLOCKS_PER_SEC;
-        cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
-        if (err == cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA copying %.2f GiB model to device memory\n",
-                    (double)model_size / 1073741824.0);
-            err = cudaMemcpy(dev, model_map, (size_t)model_size, cudaMemcpyHostToDevice);
-            if (err == cudaSuccess) {
-                g_model_device_base = (const char *)dev;
-                g_model_device_owned = 1;
-                const double t1 = clock() / (double)CLOCKS_PER_SEC;
-                fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
-                return 1;
-            }
-            fprintf(stderr, "ds4: CUDA model copy failed: %s\n", cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-        } else {
-            fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-        }
-    }
-
-    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-    if (err == cudaSuccess) {
-        void *dev = NULL;
-        err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
-        if (err == cudaSuccess && dev) {
-            g_model_device_base = (const char *)dev;
-            g_model_registered = 1;
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
-                    (double)model_size / 1073741824.0);
-        } else {
-            fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-        }
-    } else {
-        fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-    }
+    /* Do NOT cudaHostRegister the entire model: for models larger than VRAM
+     * this would make every byte GPU-accessible through HMM, competing with
+     * the non-expert tensors that actually need to live on device.
+     * Individual ranges are registered on demand by accelerator caching or
+     * by cuda_model_range_ptr fallback.  Expert weights are not cached at
+     * all — they are accessed by the CPU-only kt-kernel bridge. */
     return 1;
 }
 

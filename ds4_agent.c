@@ -518,6 +518,14 @@ static void usage(FILE *fp) {
         "  --quality              Prefer exact kernels where available.\n"
         "  --warm-weights         Touch mapped tensor pages before generation.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
+        "  --cpu-moe              Enable hybrid MoE inference: routed MoE layers run on CPU via kt-kernel.\n"
+        "  --n-cpu-moe-layers N   Number of MoE layers to offload to CPU (0 = all).\n"
+        "  --kt-weight-path PATH  Path to kt-kernel safetensor weight directory.\n"
+        "  --kt-cpuinfer N        kt-kernel CPU inference threads. Default: 96\n"
+        "  --kt-threadpool-count N\n"
+        "                         kt-kernel NUMA thread pool count. Default: 8\n"
+        "  --kt-method NAME       kt-kernel compute method: MXFP4 (default), FP8, FP8_PERCHANNEL,\n"
+        "                         RAWINT4, AMXINT4, AMXINT8.\n"
         "  --dir-steering-file FILE\n"
         "  --dir-steering-ffn F\n"
         "  --dir-steering-attn F\n"
@@ -626,6 +634,18 @@ static agent_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.engine.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe-layers")) {
+            c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-weight-path")) {
+            c.engine.kt_weight_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kt-cpuinfer")) {
+            c.engine.kt_cpuinfer = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-threadpool-count")) {
+            c.engine.kt_threadpool = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-method")) {
+            c.engine.kt_method = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

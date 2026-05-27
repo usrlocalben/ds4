@@ -73,6 +73,13 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    /* CPU-MoE: route routed MoE layers to CPU via kt-kernel bridge */
+    bool        cpu_moe;
+    int         n_cpu_moe_layers;
+    const char *kt_weight_path;
+    int         kt_cpuinfer;
+    int         kt_threadpool;
+    const char *kt_method;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

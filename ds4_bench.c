@@ -38,6 +38,12 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
+    bool cpu_moe;
+    int  n_cpu_moe_layers;
+    const char *kt_weight_path;
+    int  kt_cpuinfer;
+    int  kt_threadpool;
+    const char *kt_method;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -71,6 +77,14 @@ static void usage(FILE *fp) {
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
+        "  --cpu-moe              Enable hybrid MoE inference: routed MoE layers run on CPU via kt-kernel.\n"
+        "  --n-cpu-moe-layers N   Number of MoE layers to offload to CPU (0 = all).\n"
+        "  --kt-weight-path PATH  Path to kt-kernel safetensor weight directory.\n"
+        "  --kt-cpuinfer N        kt-kernel CPU inference threads. Default: 96\n"
+        "  --kt-threadpool-count N\n"
+        "                         kt-kernel NUMA thread pool count. Default: 8\n"
+        "  --kt-method NAME       kt-kernel compute method: MXFP4 (default), FP8, FP8_PERCHANNEL,\n"
+        "                         RAWINT4, AMXINT4, AMXINT8.\n"
         "\n"
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
@@ -234,6 +248,18 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe-layers")) {
+            c.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-weight-path")) {
+            c.kt_weight_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kt-cpuinfer")) {
+            c.kt_cpuinfer = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-threadpool-count")) {
+            c.kt_threadpool = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kt-method")) {
+            c.kt_method = need_arg(&i, argc, argv, arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -402,6 +428,12 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .cpu_moe = cfg.cpu_moe,
+        .n_cpu_moe_layers = cfg.n_cpu_moe_layers,
+        .kt_weight_path = cfg.kt_weight_path,
+        .kt_cpuinfer = cfg.kt_cpuinfer,
+        .kt_threadpool = cfg.kt_threadpool,
+        .kt_method = cfg.kt_method,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
