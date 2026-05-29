@@ -100,3 +100,12 @@ export DS4_NO_MANAGED_KV=1
 ##            30t/s decode  @ 1K context length
 ##        nvidia-smi: 49,794MiB VRAM usage w/1M ctx
 ```
+
+Legacy GGUF files are still available if you specifically need the older
+non-imatrix quants:
+
+```sh
+./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
+./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
+./download_model.sh pro          # 512 GB RAM machines, legacy non-imatrix PRO
+```

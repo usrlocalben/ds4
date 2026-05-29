@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1209,6 +1210,7 @@ typedef struct {
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
+    ds4_dist_options dist;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1511,6 +1513,11 @@ static void usage(FILE *fp) {
         "  --kt-method NAME       kt-kernel compute method: MXFP4 (default), FP8, FP8_PERCHANNEL,\n"
         "                         RAWINT4, AMXINT4, AMXINT8.\n"
         "\n"
+        "Distributed:\n");
+    ds4_dist_usage(fp);
+    fprintf(fp,
+        "\n"
+        "\n"
         "Evaluation:\n"
         "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
         "  --questions N          Run only the first N embedded questions.\n"
@@ -1559,7 +1566,25 @@ static eval_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.dist,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-eval: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
@@ -1640,6 +1665,16 @@ static eval_config parse_options(int argc, char **argv) {
         }
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
+
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
 
     if (c.max_tokens > EVAL_MAX_CONTEXT) {
         fprintf(stderr,
@@ -3780,6 +3815,34 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "ds4-eval: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "ds4-eval: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            fprintf(stderr, "ds4-eval: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
+}
+
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
@@ -3871,7 +3934,15 @@ int main(int argc, char **argv) {
         .kt_cpuinfer = cfg.kt_cpuinfer,
         .kt_threadpool = cfg.kt_threadpool,
         .kt_method = cfg.kt_method,
+        .distributed = cfg.dist,
     };
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {
@@ -3907,6 +3978,15 @@ int main(int argc, char **argv) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
+        if (trace) fclose(trace);
+        ds4_engine_close(engine);
+        free(case_sequence);
+        return 1;
+    }
+    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0)
+    {
+        ds4_session_free(session);
         if (trace) fclose(trace);
         ds4_engine_close(engine);
         free(case_sequence);

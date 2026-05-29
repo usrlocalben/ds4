@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -51,16 +52,29 @@ typedef struct {
 
 typedef struct {
     ds4_engine_options engine;
+    ds4_dist_options *dist;
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
+static volatile sig_atomic_t cli_dist_busy;
+static volatile sig_atomic_t cli_dist_notice_printed;
+
+static const char cli_dist_drain_msg[] =
+    "\nds4: stopping after the distributed cluster finishes the current token/chunk...\n";
 
 static void cli_sigint_handler(int sig) {
     (void)sig;
     cli_interrupted = 1;
+    if (cli_dist_busy && !cli_dist_notice_printed) {
+        cli_dist_notice_printed = 1;
+        ssize_t ignored = write(STDERR_FILENO,
+                                cli_dist_drain_msg,
+                                sizeof(cli_dist_drain_msg) - 1u);
+        (void)ignored;
+    }
 }
 
 static bool cli_interrupt_requested(void) {
@@ -69,6 +83,17 @@ static bool cli_interrupt_requested(void) {
 
 static void cli_interrupt_clear(void) {
     cli_interrupted = 0;
+    cli_dist_notice_printed = 0;
+}
+
+static bool cli_distributed_coordinator(const cli_config *cfg) {
+    return cfg && cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+}
+
+static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
+    if (!cli_distributed_coordinator(cfg)) return;
+    cli_dist_busy = busy ? 1 : 0;
+    if (!busy) cli_dist_notice_printed = 0;
 }
 
 static void usage(FILE *fp) {
@@ -129,6 +154,9 @@ static void usage(FILE *fp) {
         "  --kt-method NAME\n"
         "      kt-kernel compute method: MXFP4 (default), FP8, FP8_PERCHANNEL,\n"
         "      RAWINT4, AMXINT4, AMXINT8.\n"
+    );
+    ds4_dist_usage(fp);
+    fprintf(fp,
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -518,7 +546,10 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+    cli_dist_busy_set(cfg, true);
+    int sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    cli_dist_busy_set(cfg, false);
+    if (sync_rc != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
@@ -547,6 +578,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -555,13 +587,17 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
+            cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
             }
         } else {
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            cli_dist_busy_set(cfg, true);
+            int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
+            cli_dist_busy_set(cfg, false);
+            if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
@@ -966,7 +1002,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
+               cfg->gen.temperature > 0.0f ||
+               ds4_engine_mtp_draft_tokens(engine) > 1) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1153,7 +1191,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_session_set_display_progress(chat->session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err)) != 0) {
+    cli_dist_busy_set(cfg, true);
+    int sync_rc = ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err));
+    cli_dist_busy_set(cfg, false);
+    if (sync_rc != 0) {
         ds4_session_set_progress(chat->session, NULL, NULL);
         ds4_session_set_display_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
@@ -1195,6 +1236,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
@@ -1203,12 +1245,16 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
+            cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
         } else {
-            if (ds4_session_eval(chat->session, token, err, sizeof(err)) != 0) {
+            cli_dist_busy_set(cfg, true);
+            int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
+            cli_dist_busy_set(cfg, false);
+            if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
@@ -1445,13 +1491,34 @@ static cli_config parse_options(int argc, char **argv) {
         },
     };
 
+    c.dist = ds4_dist_options_create();
+    if (!c.dist) {
+        fprintf(stderr, "ds4: out of memory creating distributed options\n");
+        exit(1);
+    }
+
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
             exit(0);
-        } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse = ds4_dist_parse_cli_arg(arg,
+                                                                      &i,
+                                                                      argc,
+                                                                      argv,
+                                                                      c.dist,
+                                                                      dist_parse_err,
+                                                                      sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr, "ds4: %s\n", dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             if (c.gen.prompt) {
                 fprintf(stderr, "ds4: specify only one prompt source\n");
                 exit(2);
@@ -1594,6 +1661,11 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
     }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(c.dist, &c.engine, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4: %s\n", dist_err);
+        exit(2);
+    }
 
     return c;
 }
@@ -1609,14 +1681,37 @@ int main(int argc, char **argv) {
         int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);
+        ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
     }
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;
+    }
+    if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options dist_gen = {
+            .prompt = cfg.gen.prompt,
+            .system = cfg.gen.system,
+            .dump_logits_path = cfg.gen.dump_logits_path,
+            .dump_logprobs_path = cfg.gen.dump_logprobs_path,
+            .dump_logprobs_top_k = cfg.gen.dump_logprobs_top_k,
+            .n_predict = cfg.gen.n_predict,
+            .ctx_size = cfg.gen.ctx_size,
+            .temperature = cfg.gen.temperature,
+            .top_p = cfg.gen.top_p,
+            .min_p = cfg.gen.min_p,
+            .seed = cfg.gen.seed,
+            .think_mode = cfg.gen.think_mode,
+        };
+        int rc = ds4_dist_run(engine, cfg.dist, &dist_gen);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
     }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
@@ -1640,6 +1735,7 @@ int main(int argc, char **argv) {
         rc = run_generation(engine, &cfg);
     }
     ds4_engine_close(engine);
+    ds4_dist_options_free(cfg.dist);
     free(cfg.prompt_owned);
     return rc;
 }

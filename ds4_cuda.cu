@@ -1468,6 +1468,40 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_set_model_map_spans(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
+    if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+
+    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (offsets[i] > model_size ||
+                sizes[i] == 0 ||
+                sizes[i] > model_size - offsets[i]) {
+                return 0;
+            }
+            if (!cuda_model_copy_chunked(model_map, model_size, offsets[i], sizes[i])) {
+                (void)cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i]);
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < count; i++) {
+            if (offsets[i] > model_size ||
+                sizes[i] == 0 ||
+                sizes[i] > model_size - offsets[i]) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;

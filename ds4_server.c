@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -11462,6 +11463,8 @@ static void usage(FILE *fp) {
         "\n"
         "  -h, --help\n"
         "      Show this help.\n");
+    fprintf(fp, "\nDistributed inference:\n");
+    ds4_dist_usage(fp);
 }
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
@@ -11505,7 +11508,25 @@ static server_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
@@ -11603,6 +11624,14 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
+    }
     return c;
 }
 
@@ -11627,6 +11656,14 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
