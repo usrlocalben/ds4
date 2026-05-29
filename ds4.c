@@ -1658,6 +1658,11 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m,
                                                    const ds4_byte_range *skip,
                                                    size_t n_skip,
                                                    uint64_t *cached_out) {
+    /* Routed MoE expert weights are ~65 GiB of the model on V4-Flash but
+     * only top-K of N=256 experts fire per token — pre-caching them in VRAM
+     * wastes most of the budget on cold weights and starves the hot non-MoE
+     * tensors that every token reads.  Skip them at the span-build stage so
+     * the cap fills with attn / shared FFN / embedding / output head. */
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -1670,9 +1675,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m,
         if (n_skip > 0) {
             bool is_expert = false;
             for (size_t s = 0; s < n_skip; s++) {
-                uint64_t s_start = skip[s].start;
-                uint64_t s_end = skip[s].end;
-                if (t->abs_offset < s_end && t->abs_offset + t->bytes > s_start) {
+                if (t->abs_offset < skip[s].end && t->abs_offset + t->bytes > skip[s].start) {
                     is_expert = true;
                     break;
                 }
@@ -13697,11 +13700,9 @@ static bool metal_graph_eval_token_raw_swa_top(
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
                                                   token, pos, true, true);
     if (ok) {
-        ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                           g->logits,
-                                           DS4_N_VOCAB,
-                                           1,
-                                           1) != 0;
+        ok = ds4_gpu_argmax_tensor(g->comp_selected,
+                                   g->logits,
+                                   DS4_N_VOCAB) != 0;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
@@ -13808,11 +13809,9 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                                     mtp,
                                                     base_weights->output->dim[1]);
     if (ok && top_id) {
-        ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                           g->logits,
-                                           DS4_N_VOCAB,
-                                           1,
-                                           1) != 0;
+        ok = ds4_gpu_argmax_tensor(g->comp_selected,
+                                   g->logits,
+                                   DS4_N_VOCAB) != 0;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     g->cur_hc = saved_cur;
@@ -14599,7 +14598,14 @@ static bool metal_graph_verify_suffix_tops(
                                                       n_tokens,
                                                       weights->output->dim[1]);
     if (ok) {
-        if (top_rows) {
+        if (top_rows == 1) {
+            /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
+             * argmax kernel (single-block tree-reduce) instead of the legacy
+             * indexer_topk_kernel's single-thread O(n_vocab * top_k) fall-through. */
+            ok = ds4_gpu_argmax_tensor(g->comp_selected,
+                                       g->spec_logits,
+                                       DS4_N_VOCAB) != 0;
+        } else if (top_rows) {
             ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                g->spec_logits,
                                                DS4_N_VOCAB,
@@ -14730,11 +14736,9 @@ static bool metal_graph_verify_decode2_exact(
         g->cur_hc = cur0;
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                                   g->logits,
-                                                   DS4_N_VOCAB,
-                                                   1,
-                                                   1) != 0;
+        if (ok) ok = ds4_gpu_argmax_tensor(g->comp_selected,
+                                           g->logits,
+                                           DS4_N_VOCAB) != 0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
         g->cur_hc = saved_cur;
@@ -18375,7 +18379,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             skip = calloc((size_t)DS4_N_LAYER * 3, sizeof(*skip));
             n_skip = engine_collect_cpu_moe_routed_ranges(e, skip);
         }
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model, skip, n_skip)) {
+        if (!accelerator_cache_model_tensors(e->backend, &e->model, skip, n_skip)) {
             free(skip);
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -18384,6 +18388,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         free(skip);
+        /* Also populate the cache for the MTP support model when loaded.
+         * MTP MoE experts are cached (not skipped) since the MTP model is
+         * much smaller and CPU-MoE is only configured for the main model. */
+        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model, NULL, 0)) {
+            fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
