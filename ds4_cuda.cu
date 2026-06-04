@@ -5964,7 +5964,29 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+    if (top_k == 1024u && n_comp <= 2048u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                           (const float *)scores->ptr,
+                                                           n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 1024 2048 launch");
+    }
+    if (top_k == 1024u && n_comp <= 4096u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                           (const float *)scores->ptr,
+                                                           n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 1024 4096 launch");
+    }
+    if (top_k == 1024u && n_comp <= 8192u &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                                               (const float *)scores->ptr,
+                                                               n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk 1024 8192 launch");
+    }
+    if ((top_k == 512u || top_k == 1024u) && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
@@ -7324,20 +7346,6 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
-        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
-        n_comp == 0 || top_k == 0 ||
-        sinks_offset > model_size ||
-        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
-        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
-        return 0;
-    }
-    if (top_k > 512u) return 0;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -7866,25 +7874,97 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
             scale);
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
+
+static float softplus_host(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static int router_select_cpu(int32_t *selected, float *weights, float *probs,
+                             const float *bias, const int32_t *hash,
+                             const float *logits, const int32_t *tokens,
+                             int32_t token_scalar, uint32_t hash_rows,
+                             uint32_t n_tokens, int has_bias, int hash_mode,
+                             uint32_t n_expert, uint32_t n_expert_used,
+                             float expert_weight_scale) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int32_t tok = tokens ? tokens[t] : token_scalar;
+        float *prob_row = probs + (uint64_t)t * n_expert;
+        int32_t *sel_row = selected + (uint64_t)t * n_expert_used;
+        float *w_row = weights + (uint64_t)t * n_expert_used;
+        const float *log_row = logits + (uint64_t)t * n_expert;
+
+        for (uint32_t e = 0; e < n_expert; e++) {
+            prob_row[e] = sqrtf(softplus_host(log_row[e]));
+        }
+
+        if (hash_mode) {
+            if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
+            const int32_t *hash_row = hash + (uint64_t)tok * n_expert_used;
+            float sum = 0.0f;
+            for (uint32_t j = 0; j < n_expert_used; j++) {
+                int32_t e = hash_row[j];
+                sel_row[j] = e;
+                float v = (e >= 0 && (uint32_t)e < n_expert) ? prob_row[e] : 0.0f;
+                w_row[j] = v;
+                sum += v;
+            }
+            sum = fmaxf(sum, 6.103515625e-5f);
+            for (uint32_t j = 0; j < n_expert_used; j++) {
+                w_row[j] = w_row[j] / sum * expert_weight_scale;
+            }
+        } else {
+            for (uint32_t j = 0; j < n_expert_used; j++) sel_row[j] = -1;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                float score = prob_row[e] + (has_bias ? bias[e] : 0.0f);
+                for (uint32_t j = 0; j < n_expert_used; j++) {
+                    if (sel_row[j] < 0 ||
+                        score > prob_row[sel_row[j]] + (has_bias ? bias[sel_row[j]] : 0.0f)) {
+                        for (int k = (int)n_expert_used - 1; k > (int)j; k--) {
+                            sel_row[k] = sel_row[k - 1];
+                        }
+                        sel_row[j] = (int32_t)e;
+                        break;
+                    }
+                }
+            }
+            float sum = 0.0f;
+            for (uint32_t j = 0; j < n_expert_used; j++) {
+                int e = sel_row[j];
+                float v = (e >= 0 && (uint32_t)e < n_expert) ? prob_row[e] : 0.0f;
+                w_row[j] = v;
+                sum += v;
+            }
+            sum = fmaxf(sum, 6.103515625e-5f);
+            for (uint32_t j = 0; j < n_expert_used; j++) {
+                w_row[j] = w_row[j] / sum * expert_weight_scale;
+            }
+        }
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    const bool use_gpu = (n_expert == 256u && n_expert_used == 6u && fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f);
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (ok && has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) ok = 0;
-        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < n_expert * sizeof(float)) ok = 0;
+        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, n_expert * sizeof(float), "router_bias");
         if (!bias) ok = 0;
     }
     if (ok && hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
         else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) ok = 0;
     }
-    if (ok) {
+    if (!ok) return 0;
+    if (use_gpu) {
         if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             dim3 block(32, 4, 1);
@@ -7901,75 +7981,192 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
                                           has_bias && !hash_mode, hash_mode);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
+    } else {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "ds4: CUDA router select using CPU fallback (n_expert=%u, scale=%.1f)\n", n_expert, expert_weight_scale);
+            warned = 1;
+        }
+        size_t logits_bytes = (size_t)n_expert * sizeof(float);
+        float *probs_host = (float *)malloc(logits_bytes);
+        if (!probs_host) return 0;
+        ok = cuda_ok(cudaMemcpy(probs_host, logits->ptr, logits_bytes, cudaMemcpyDeviceToHost), "router fallback logits read");
+        float *bias_host = NULL;
+        if (ok && has_bias && !hash_mode) {
+            bias_host = (float *)malloc(n_expert * sizeof(float));
+            if (bias_host) {
+                ok = cuda_ok(cudaMemcpy(bias_host, bias, n_expert * sizeof(float), cudaMemcpyDeviceToHost), "router fallback bias read");
+            } else {
+                ok = 0;
+            }
+        }
+        int32_t *hash_host = NULL;
+        if (ok && hash_mode) {
+            size_t hash_bytes = (size_t)hash_rows * n_expert_used * sizeof(int32_t);
+            hash_host = (int32_t *)malloc(hash_bytes);
+            if (hash_host) {
+                ok = cuda_ok(cudaMemcpy(hash_host, hash, hash_bytes, cudaMemcpyDeviceToHost), "router fallback hash read");
+            } else {
+                ok = 0;
+            }
+        }
+        size_t sel_bytes = (size_t)n_expert_used * sizeof(int32_t);
+        size_t w_bytes = (size_t)n_expert_used * sizeof(float);
+        int32_t *selected_host = (int32_t *)malloc(sel_bytes);
+        float *weights_host = (float *)malloc(w_bytes);
+        if (!selected_host || !weights_host) ok = 0;
+        if (ok) {
+            ok = router_select_cpu(selected_host, weights_host, probs_host,
+                                   bias_host, hash_host,
+                                   probs_host, NULL,
+                                   tok, hash_rows, 1,
+                                   has_bias, hash_mode,
+                                   n_expert, n_expert_used,
+                                   expert_weight_scale);
+        }
+        if (ok) ok = cuda_ok(cudaMemcpy(probs->ptr, probs_host, logits_bytes, cudaMemcpyHostToDevice), "router fallback probs write");
+        if (ok) ok = cuda_ok(cudaMemcpy(selected->ptr, selected_host, sel_bytes, cudaMemcpyHostToDevice), "router fallback selected write");
+        if (ok) ok = cuda_ok(cudaMemcpy(weights->ptr, weights_host, w_bytes, cudaMemcpyHostToDevice), "router fallback weights write");
+        free(probs_host);
+        free(bias_host);
+        free(hash_host);
+        free(selected_host);
+        free(weights_host);
     }
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
-        logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
+    const bool use_gpu = (n_expert == 256u && n_expert_used == 6u && fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f);
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
-        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < n_expert * sizeof(float)) return 0;
+        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, n_expert * sizeof(float), "router_bias");
         if (!bias) return 0;
     }
     if (hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
         hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) return 0;
     }
-    if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
-        getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-        dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
-                                                                        (float *)weights->ptr,
-                                                                        (float *)probs->ptr,
-                                                                        bias,
-                                                                        hash,
-                                                                        (const float *)logits->ptr,
-                                                                        (const int32_t *)tokens->ptr,
-                                                                        0,
-                                                                        hash_rows,
-                                                                        n_tokens,
-                                                                        has_bias && !hash_mode,
-                                                                        hash_mode);
-    } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-        router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
-                                                         (float *)weights->ptr,
-                                                         (float *)probs->ptr,
-                                                         bias,
-                                                         hash,
-                                                         (const float *)logits->ptr,
-                                                         (const int32_t *)tokens->ptr,
-                                                         0,
-                                                         hash_rows,
-                                                         n_tokens,
-                                                         has_bias && !hash_mode,
-                                                         hash_mode);
+    if (use_gpu) {
+        if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
+            getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+            dim3 block(32, 4, 1);
+            router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
+                                                                            (float *)weights->ptr,
+                                                                            (float *)probs->ptr,
+                                                                            bias,
+                                                                            hash,
+                                                                            (const float *)logits->ptr,
+                                                                            (const int32_t *)tokens->ptr,
+                                                                            0,
+                                                                            hash_rows,
+                                                                            n_tokens,
+                                                                            has_bias && !hash_mode,
+                                                                            hash_mode);
+        } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+            router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
+                                                             (float *)weights->ptr,
+                                                             (float *)probs->ptr,
+                                                             bias,
+                                                             hash,
+                                                             (const float *)logits->ptr,
+                                                             (const int32_t *)tokens->ptr,
+                                                             0,
+                                                             hash_rows,
+                                                             n_tokens,
+                                                             has_bias && !hash_mode,
+                                                             hash_mode);
+        } else {
+            router_select_kernel<<<n_tokens, 1>>>((int32_t *)selected->ptr,
+                                                  (float *)weights->ptr,
+                                                  (float *)probs->ptr,
+                                                  bias,
+                                                  hash,
+                                                  (const float *)logits->ptr,
+                                                  (const int32_t *)tokens->ptr,
+                                                  0,
+                                                  hash_rows,
+                                                  n_tokens,
+                                                  has_bias && !hash_mode,
+                                                  hash_mode);
+        }
+        return cuda_ok(cudaGetLastError(), "router_select launch");
     } else {
-        router_select_kernel<<<n_tokens, 1>>>((int32_t *)selected->ptr,
-                                              (float *)weights->ptr,
-                                              (float *)probs->ptr,
-                                              bias,
-                                              hash,
-                                              (const float *)logits->ptr,
-                                              (const int32_t *)tokens->ptr,
-                                              0,
-                                              hash_rows,
-                                              n_tokens,
-                                              has_bias && !hash_mode,
-                                              hash_mode);
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "ds4: CUDA router select using CPU fallback (n_expert=%u, scale=%.1f)\n", n_expert, expert_weight_scale);
+            warned = 1;
+        }
+        int ok = 1;
+        size_t logits_bytes = (size_t)n_tokens * n_expert * sizeof(float);
+        float *probs_host = (float *)malloc(logits_bytes);
+        if (!probs_host) return 0;
+        ok = cuda_ok(cudaMemcpy(probs_host, logits->ptr, logits_bytes, cudaMemcpyDeviceToHost), "router fallback logits read");
+        int32_t *tokens_host = NULL;
+        if (ok && hash_mode) {
+            size_t tokens_bytes = (size_t)n_tokens * sizeof(int32_t);
+            tokens_host = (int32_t *)malloc(tokens_bytes);
+            if (tokens_host) {
+                ok = cuda_ok(cudaMemcpy(tokens_host, tokens->ptr, tokens_bytes, cudaMemcpyDeviceToHost), "router fallback tokens read");
+            } else {
+                ok = 0;
+            }
+        }
+        float *bias_host = NULL;
+        if (ok && has_bias && !hash_mode) {
+            bias_host = (float *)malloc(n_expert * sizeof(float));
+            if (bias_host) {
+                ok = cuda_ok(cudaMemcpy(bias_host, bias, n_expert * sizeof(float), cudaMemcpyDeviceToHost), "router fallback bias read");
+            } else {
+                ok = 0;
+            }
+        }
+        int32_t *hash_host = NULL;
+        if (ok && hash_mode) {
+            size_t hash_bytes = (size_t)hash_rows * n_expert_used * sizeof(int32_t);
+            hash_host = (int32_t *)malloc(hash_bytes);
+            if (hash_host) {
+                ok = cuda_ok(cudaMemcpy(hash_host, hash, hash_bytes, cudaMemcpyDeviceToHost), "router fallback hash read");
+            } else {
+                ok = 0;
+            }
+        }
+        size_t sel_bytes = (size_t)n_tokens * n_expert_used * sizeof(int32_t);
+        size_t w_bytes = (size_t)n_tokens * n_expert_used * sizeof(float);
+        int32_t *selected_host = (int32_t *)malloc(sel_bytes);
+        float *weights_host = (float *)malloc(w_bytes);
+        if (!selected_host || !weights_host) ok = 0;
+        if (ok) {
+            ok = router_select_cpu(selected_host, weights_host, probs_host,
+                                   bias_host, hash_host,
+                                   probs_host, tokens_host,
+                                   0, hash_rows, n_tokens,
+                                   has_bias, hash_mode,
+                                   n_expert, n_expert_used,
+                                   expert_weight_scale);
+        }
+        if (ok) ok = cuda_ok(cudaMemcpy(probs->ptr, probs_host, logits_bytes, cudaMemcpyHostToDevice), "router fallback probs write");
+        if (ok) ok = cuda_ok(cudaMemcpy(selected->ptr, selected_host, sel_bytes, cudaMemcpyHostToDevice), "router fallback selected write");
+        if (ok) ok = cuda_ok(cudaMemcpy(weights->ptr, weights_host, w_bytes, cudaMemcpyHostToDevice), "router fallback weights write");
+        free(probs_host);
+        free(tokens_host);
+        free(bias_host);
+        free(hash_host);
+        free(selected_host);
+        free(weights_host);
+        return ok;
     }
-    return cuda_ok(cudaGetLastError(), "router_select launch");
 }
 
 __device__ static float dev_f16_to_f32(uint16_t v) {

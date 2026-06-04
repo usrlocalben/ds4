@@ -10919,7 +10919,7 @@ static bool metal_graph_encode_decode_layer(
                 metal_graph_decode_indexer_sparse_threshold(g);
             if (ok &&
                 g->layer_n_comp[il] > decode_sparse_threshold &&
-                g->layer_n_index_comp[il] > DS4_N_INDEXER_TOP_K) {
+                g->layer_n_index_comp[il] > 512u) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
                     layer->indexer_attn_q_b->type != DS4_TENSOR_F16 ||
@@ -10988,7 +10988,7 @@ static bool metal_graph_encode_decode_layer(
                                                            g->indexer_scores,
                                                            g->layer_n_index_comp[il],
                                                            1,
-                                                           DS4_N_INDEXER_TOP_K) != 0;
+                                                            (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)) != 0;
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
                                                                     il,
@@ -11032,8 +11032,8 @@ static bool metal_graph_encode_decode_layer(
                      * the score/top-k/attention implementation while preserving
                      * DS4_N_INDEXER_TOP_K.
                      */
-                    n_selected = DS4_N_INDEXER_TOP_K < g->layer_n_index_comp[il]
-                        ? DS4_N_INDEXER_TOP_K
+                    n_selected = (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u) < g->layer_n_index_comp[il]
+                        ? (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)
                         : g->layer_n_index_comp[il];
                 }
             }
@@ -13568,7 +13568,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM) != 0;
-            if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+            if (ok && ratio == 4 && n_comp > 512u) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary(NULL,
@@ -13609,7 +13609,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        g->indexer_scores,
                                                        n_comp,
                                                        n_tokens,
-                                                       DS4_N_INDEXER_TOP_K) != 0;
+                                                       (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("topk",
                                                                         il,
@@ -13648,11 +13648,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_cap,
                                                                               raw_start,
                                                                               n_comp,
-                                                                              DS4_N_INDEXER_TOP_K,
-                                                                              g->raw_window,
-                                                                              ratio,
-                                                                              DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                               (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u),
+                                                                               g->raw_window,
+                                                                               ratio,
+                                                                               DS4_N_HEAD,
+                                                                               DS4_N_HEAD_DIM) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -13687,7 +13687,7 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
 
-        const bool topk_prefill_needed = ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
+        const bool topk_prefill_needed = ratio == 4 && n_comp > 512u;
         if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
             const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
             double index_stage_t0 = 0.0;
@@ -13729,7 +13729,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                    g->indexer_scores,
                                                    n_comp,
                                                    n_tokens,
-                                                   DS4_N_INDEXER_TOP_K) != 0;
+                                                   (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("topk",
                                                                     il,
@@ -13762,7 +13762,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->raw_cap,
                                                                           0,
                                                                           n_comp,
-                                                                          DS4_N_INDEXER_TOP_K,
+                                                                          (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u),
                                                                           g->raw_window,
                                                                           ratio,
                                                                           DS4_N_HEAD,
@@ -13827,7 +13827,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 uint32_t n_selected = 0;
                 ds4_gpu_tensor *comp_mask = NULL;
 
-                if (ratio == 4 && cur_comp > DS4_N_INDEXER_TOP_K) {
+                if (ratio == 4 && cur_comp > 512u) {
                     const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                     ds4_gpu_tensor *indexer_q_view = metal_graph_tensor_row_view(
                             g->batch_indexer_q, t, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM);
@@ -13846,18 +13846,18 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        g->indexer_scores,
                                                        cur_index,
                                                        1,
-                                                       DS4_N_INDEXER_TOP_K) != 0 &&
+                                                       (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)) != 0 &&
                          ds4_gpu_dsv4_topk_mask_tensor(g->comp_mask,
                                                          g->comp_selected,
                                                          cur_index,
                                                          1,
-                                                         DS4_N_INDEXER_TOP_K) != 0;
+                                                         (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)) != 0;
                     ds4_gpu_tensor_free(indexer_w_view);
                     ds4_gpu_tensor_free(indexer_q_view);
                     if (ok) {
                         comp_mask = g->comp_mask;
-                        n_selected = DS4_N_INDEXER_TOP_K < cur_index
-                            ? DS4_N_INDEXER_TOP_K
+                        n_selected = (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u) < cur_index
+                            ? (DS4_N_INDEXER_TOP_K < 512u ? DS4_N_INDEXER_TOP_K : 512u)
                             : cur_index;
                     }
                 }
