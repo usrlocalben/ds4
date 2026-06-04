@@ -19730,7 +19730,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     DS4_N_EXPERT_USED,
                     DS4_N_EMBD,
                     DS4_N_FF_EXP,
+                    KTB_IO_F32,
                     method,
+                    32,  /* MXFP4 group_size */
                     DS4_SWIGLU_CLAMP_EXP);
                 if (!e->kt_moe[il]) {
                     fprintf(stderr, "ds4: failed to create kt-kernel MoE for layer %u\n", il);
